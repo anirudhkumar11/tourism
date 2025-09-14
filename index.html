@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>Authority – Tourist Monitor</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<style>
+  :root {
+    --bg-soft: #FFE1D7;
+    --blue-light: #84AFFB;
+    --blue-deep: #0259DD;
+    --accent: #FF6648;
+  }
+  body { margin:0; font-family: 'Segoe UI', sans-serif; background: var(--bg-soft); color: var(--blue-deep); display:flex; height:100vh; overflow:hidden; }
+  #sidebar { width:300px; background:var(--blue-light); padding:15px; display:flex; flex-direction:column; gap:12px; box-shadow:4px 0 12px rgba(0,0,0,0.1); }
+  #sidebar h2{text-align:center;margin:5px 0;font-weight:700;}
+  #zoneInfo{background:#fff;padding:8px;border-radius:6px;text-align:center;color:var(--blue-deep);font-weight:600;box-shadow:0 2px 6px rgba(0,0,0,.15);}
+  #touristList{flex:1;overflow-y:auto;background:#fff;border-radius:8px;padding:8px;box-shadow:inset 0 2px 6px rgba(0,0,0,.1);}
+  #touristList h3{margin:4px 0;font-size:15px;}
+  .touristItem{padding:6px 8px;border-bottom:1px solid #ddd;font-size:14px;display:flex;justify-content:space-between;}
+  .inside{color:green;font-weight:600}.outside{color:red;font-weight:600}
+  #notifications,#history{background:#fff;padding:8px;border-radius:8px;height:120px;overflow-y:auto;box-shadow:inset 0 2px 6px rgba(0,0,0,.1);font-size:13px;}
+  .notif,.hist{margin-bottom:6px}
+  .notif span{font-weight:bold}
+  #map-container{flex:1;padding:20px;display:flex;align-items:center;justify-content:center;}
+  #map{width:100%;height:100%;border-radius:20px;border:3px solid var(--blue-light);box-shadow:0 6px 16px rgba(0,0,0,.2);}
+</style>
+</head>
+<body>
+  <div id="sidebar">
+    <h2>Tourist Monitoring</h2>
+    <div id="zoneInfo">Loading Zone...</div>
+    <div id="touristList"><h3>Tourists</h3></div>
+    <div><h3>Notifications</h3><div id="notifications"></div></div>
+    <div><h3>Travel History</h3><div id="history"></div></div>
+  </div>
+
+  <div id="map-container">
+    <div id="map"></div>
+  </div>
+
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+import { getDatabase, ref, onValue } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-database.js";
+
+const firebaseConfig = {
+  apiKey: "AIzaSyAzwiwp0ByoUkofWPJG1Ux8BY8ueCDwVjM",
+  authDomain: "geo-fencing-202f9.firebaseapp.com",
+  databaseURL: "https://geo-fencing-202f9-default-rtdb.asia-southeast1.firebasedatabase.app",
+  projectId: "geo-fencing-202f9",
+  storageBucket: "geo-fencing-202f9.firebasestorage.app",
+  messagingSenderId: "815479242725",
+  appId: "1:815479242725:web:0eaae779912a495b94f90c",
+  measurementId: "G-WB7LFFPT4D"
+};
+const app = initializeApp(firebaseConfig);
+const db = getDatabase(app);
+
+const map = L.map('map').setView([20.5937, 78.9629], 6);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution:'&copy; OpenStreetMap contributors' }).addTo(map);
+
+let currentZoneLayer = null;
+let currentZoneGeoJSON = null;
+let currentZoneIsCircle = false;
+let touristMarkers = {};
+let markerStates = {};
+
+onValue(ref(db, 'zones/currentZone'), snap => {
+  const z = snap.val();
+  if (!z) return;
+  if (currentZoneLayer) map.removeLayer(currentZoneLayer);
+  currentZoneGeoJSON = null;
+  currentZoneIsCircle = false;
+
+  if (z.type === 'circle') {
+    currentZoneLayer = L.circle([z.center.lat, z.center.lng], { radius: z.radius, color: '#FF6648' }).addTo(map);
+    currentZoneIsCircle = true;
+    document.getElementById('zoneInfo').textContent = `Circle Zone (radius ${Math.round(z.radius)} m)`;
+  } else if (z.type === 'polygon') {
+    currentZoneLayer = L.polygon(z.points.map(p => [p.lat, p.lng]), { color: '#FF6648' }).addTo(map);
+    currentZoneGeoJSON = currentZoneLayer.toGeoJSON();
+    document.getElementById('zoneInfo').textContent = `Polygon Zone (${z.points.length} pts)`;
+  }
+  map.fitBounds(currentZoneLayer.getBounds(), { padding:[40,40] });
+});
+
+onValue(ref(db, 'tourists'), snapshot => {
+  const data = snapshot.val() || {};
+  for (const id in data) {
+    const t = data[id];
+    const lat = t.latitude ?? t.lat;
+    const lng = t.longitude ?? t.lng;
+    if (!touristMarkers[id]) {
+      touristMarkers[id] = L.marker([lat, lng]).addTo(map).bindPopup(`Tourist: ${id}`);
+      markerStates[id] = { outside: false };
+    } else {
+      touristMarkers[id].setLatLng([lat, lng]);
+    }
+    checkInsideZone(id, lat, lng);
+    addHistory(`${id} moved to (${lat.toFixed(4)}, ${lng.toFixed(4)})`);
+  }
+  updateTouristList();
+});
+
+const turfScript = document.createElement('script');
+turfScript.src = 'https://cdn.jsdelivr.net/npm/@turf/turf@6/turf.min.js';
+document.head.appendChild(turfScript);
+
+function checkInsideZone(id, lat, lng) {
+  if (!currentZoneLayer) return;
+  let inside = false;
+  if (currentZoneIsCircle && currentZoneLayer instanceof L.Circle) {
+    const center = currentZoneLayer.getLatLng();
+    inside = map.distance(center, L.latLng(lat, lng)) <= currentZoneLayer.getRadius();
+  } else if (currentZoneGeoJSON && window.turf) {
+    inside = turf.booleanPointInPolygon(turf.point([lng, lat]), currentZoneGeoJSON);
+  }
+  const marker = touristMarkers[id];
+  if (!markerStates[id]) markerStates[id] = { outside: !inside };
+  if (!inside && !markerStates[id].outside) {
+    markerStates[id].outside = true;
+    addNotification(`⚠️ Tourist <span>${id}</span> left the zone!`);
+  } else if (inside && markerStates[id].outside) {
+    markerStates[id].outside = false;
+    addNotification(`✅ Tourist <span>${id}</span> re-entered the zone`);
+  }
+}
+
+function updateTouristList() {
+  const list = document.getElementById('touristList');
+  list.innerHTML = "<h3>Tourists</h3>";
+  for (const id in touristMarkers) {
+    const st = markerStates[id] && markerStates[id].outside ? "outside" : "inside";
+    list.innerHTML += `<div class="touristItem"><span>${id}</span><span class="${st}">${st}</span></div>`;
+  }
+}
+
+function addNotification(msg) {
+  const box = document.getElementById('notifications');
+  box.innerHTML = `<div class="notif">${msg}</div>` + box.innerHTML;
+}
+
+function addHistory(msg) {
+  const hbox = document.getElementById('history');
+  const time = new Date().toLocaleTimeString();
+  hbox.innerHTML = `<div class="hist">${time} – ${msg}</div>` + hbox.innerHTML;
+}
+</script>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+</body>
+</html>
